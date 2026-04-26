@@ -3,14 +3,18 @@ use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use pumpkin_plugin_api::{
     Context, Plugin, PluginMetadata, Server,
     command::{Command, CommandError, CommandNode, CommandSender, ConsumedArgs},
     command_wit::{Arg, ArgumentType, StringType},
     commands::CommandHandler,
-    // Добавили PlayerMoveEvent в импорты:
-    events::{EventData, EventHandler, EventPriority, PlayerChatEvent, PlayerJoinEvent, PlayerLeaveEvent, PlayerMoveEvent},
+    events::{
+        EventData, EventHandler, EventPriority, 
+        PlayerChatEvent, PlayerJoinEvent, PlayerLeaveEvent, PlayerMoveEvent, PlayerLoginEvent,
+        BlockBreakEvent, BlockPlaceEvent, BlockCanBuildEvent
+    },
     permission::{Permission, PermissionDefault},
     text::{NamedColor, TextComponent},
 };
@@ -26,6 +30,10 @@ pub struct AuthState {
     pub database: Arc<Mutex<HashMap<String, String>>>,
     // Sessions: UUIDs of currently logged in players
     pub logged_in: Arc<Mutex<HashSet<String>>>,
+    
+    pub login_attempts: Arc<Mutex<HashMap<String, u8>>>,
+    pub temp_bans: Arc<Mutex<HashMap<String, u64>>>,
+    
     pub data_path: PathBuf,
 }
 
@@ -39,6 +47,8 @@ impl AuthState {
         let state = AuthState {
             database: Arc::new(Mutex::new(database)),
             logged_in: Arc::new(Mutex::new(HashSet::new())),
+            login_attempts: Arc::new(Mutex::new(HashMap::new())),
+            temp_bans: Arc::new(Mutex::new(HashMap::new())),
             data_path: path,
         };
 
@@ -75,7 +85,6 @@ impl AuthState {
         }
     }
 
-    // Password hashing (SHA-256 + simple static salt)
     pub fn hash_password(password: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(b"PumpkinSuperSecretSalt_"); 
@@ -90,9 +99,56 @@ impl AuthState {
     pub fn is_logged_in(&self, uuid: &str) -> bool {
         self.logged_in.lock().unwrap().contains(uuid)
     }
+
+
+    pub fn unix_now() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    }
+
+    pub fn get_ban_time_left(&self, uuid: &str) -> Option<u64> {
+        let bans = self.temp_bans.lock().unwrap();
+        if let Some(&expire_time) = bans.get(uuid) {
+            let now = Self::unix_now();
+            if now < expire_time {
+                return Some(expire_time - now);
+            }
+        }
+        None
+    }
+
+    pub fn add_failed_attempt(&self, uuid: &str) -> u8 {
+        let mut attempts = self.login_attempts.lock().unwrap();
+        let count = attempts.entry(uuid.to_string()).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    pub fn reset_attempts(&self, uuid: &str) {
+        self.login_attempts.lock().unwrap().remove(uuid);
+    }
+
+    pub fn temp_ban(&self, uuid: &str, duration_secs: u64) {
+        let expire = Self::unix_now() + duration_secs;
+        self.temp_bans.lock().unwrap().insert(uuid.to_string(), expire);
+    }
 }
 
 // --- EVENT HANDLERS ---
+
+struct LoginHandler;
+impl EventHandler<PlayerLoginEvent> for LoginHandler {
+    fn handle(&self, _server: Server, mut event: EventData<PlayerLoginEvent>) -> EventData<PlayerLoginEvent> {
+        let state = AUTH_STATE.get().unwrap();
+        let uuid = event.player.get_id();
+
+        if let Some(left) = state.get_ban_time_left(&uuid) {
+            let msg = TextComponent::text(&format!("You are temporarily banned! Wait {} seconds.", left));
+            msg.color_named(NamedColor::Red);
+            event.kick_message = msg;
+        }
+        event
+    }
+}
 
 struct JoinHandler;
 impl EventHandler<PlayerJoinEvent> for JoinHandler {
@@ -134,8 +190,6 @@ impl EventHandler<PlayerLeaveEvent> for LeaveHandler {
     fn handle(&self, _server: Server, event: EventData<PlayerLeaveEvent>) -> EventData<PlayerLeaveEvent> {
         let state = AUTH_STATE.get().unwrap();
         let uuid = event.player.get_id();
-        
-        // Remove player from logged in list on disconnect
         state.logged_in.lock().unwrap().remove(&uuid);
         event
     }
@@ -145,37 +199,64 @@ struct ChatHandler;
 impl EventHandler<PlayerChatEvent> for ChatHandler {
     fn handle(&self, _server: Server, mut event: EventData<PlayerChatEvent>) -> EventData<PlayerChatEvent> {
         let state = AUTH_STATE.get().unwrap();
-        let uuid = event.player.get_id();
-
-        // If player is not logged in - block chat
-        if !state.is_logged_in(&uuid) {
-            event.cancelled = true; // Cancel message
-
+        if !state.is_logged_in(&event.player.get_id()) {
+            event.cancelled = true;
             let warning = TextComponent::text("You cannot chat before logging in!");
             warning.color_named(NamedColor::Red);
             event.player.send_system_message(warning, false);
         }
-
         event
     }
 }
 
-// НОВЫЙ ОБРАБОТЧИК: Заморозка передвижения
 struct MoveHandler;
 impl EventHandler<PlayerMoveEvent> for MoveHandler {
     fn handle(&self, _server: Server, mut event: EventData<PlayerMoveEvent>) -> EventData<PlayerMoveEvent> {
         let state = AUTH_STATE.get().unwrap();
-        let uuid = event.player.get_id();
-
-        // Если игрок не авторизован - отменяем его шаги (замораживаем на месте)
-        if !state.is_logged_in(&uuid) {
+        if !state.is_logged_in(&event.player.get_id()) {
             event.cancelled = true;
         }
-
         event
     }
 }
 
+struct BlockBreakHandler;
+impl EventHandler<BlockBreakEvent> for BlockBreakHandler {
+    fn handle(&self, _server: Server, mut event: EventData<BlockBreakEvent>) -> EventData<BlockBreakEvent> {
+        let state = AUTH_STATE.get().unwrap();
+        
+        // В документации сказано "contains the player (if any)", поэтому используем Option
+        if let Some(player) = &event.player {
+            let uuid = player.get_id();
+            if !state.is_logged_in(&uuid) {
+                event.cancelled = true;
+            }
+        }
+        event
+    }
+}
+
+struct BlockPlaceHandler;
+impl EventHandler<BlockPlaceEvent> for BlockPlaceHandler {
+    fn handle(&self, _server: Server, mut event: EventData<BlockPlaceEvent>) -> EventData<BlockPlaceEvent> {
+        let state = AUTH_STATE.get().unwrap();
+        if !state.is_logged_in(&event.player.get_id()) {
+            event.cancelled = true;
+        }
+        event
+    }
+}
+
+struct BlockCanBuildHandler;
+impl EventHandler<BlockCanBuildEvent> for BlockCanBuildHandler {
+    fn handle(&self, _server: Server, mut event: EventData<BlockCanBuildEvent>) -> EventData<BlockCanBuildEvent> {
+        let state = AUTH_STATE.get().unwrap();
+        if !state.is_logged_in(&event.player.get_id()) {
+            event.cancelled = true;
+        }
+        event
+    }
+}
 
 // --- COMMANDS ---
 
@@ -185,6 +266,14 @@ impl CommandHandler for RegisterExecutor {
         let Some(player) = sender.as_player() else { return Ok(0); };
         let uuid = player.get_id();
         let state = AUTH_STATE.get().unwrap();
+
+        // Проверяем бан
+        if let Some(left) = state.get_ban_time_left(&uuid) {
+            let msg = TextComponent::text(&format!("You are banned! Please wait {} seconds.", left));
+            msg.color_named(NamedColor::Red);
+            sender.send_message(msg);
+            return Ok(0);
+        }
 
         if state.is_registered(&uuid) {
             let msg = TextComponent::text("You are already registered! Use /login.");
@@ -203,12 +292,10 @@ impl CommandHandler for RegisterExecutor {
             return Ok(0);
         }
 
-        // Hash and save
         let hashed = AuthState::hash_password(pass1.as_str());
         state.database.lock().unwrap().insert(uuid.clone(), hashed);
         state.save_db();
         
-        // Automatically login after registration
         state.logged_in.lock().unwrap().insert(uuid);
 
         let msg = TextComponent::text("Registration successful! Have fun.");
@@ -225,6 +312,13 @@ impl CommandHandler for LoginExecutor {
         let Some(player) = sender.as_player() else { return Ok(0); };
         let uuid = player.get_id();
         let state = AUTH_STATE.get().unwrap();
+
+        if let Some(left) = state.get_ban_time_left(&uuid) {
+            let msg = TextComponent::text(&format!("You are banned! Please wait {} seconds.", left));
+            msg.color_named(NamedColor::Red);
+            sender.send_message(msg);
+            return Ok(0);
+        }
 
         if !state.is_registered(&uuid) {
             let msg = TextComponent::text("You are not registered! Use /register.");
@@ -246,16 +340,29 @@ impl CommandHandler for LoginExecutor {
         let db = state.database.lock().unwrap();
         if let Some(saved_hash) = db.get(&uuid) {
             if saved_hash == &input_hash {
-                // Correct password
-                state.logged_in.lock().unwrap().insert(uuid);
+                // Правильный пароль
+                state.logged_in.lock().unwrap().insert(uuid.clone());
+                state.reset_attempts(&uuid); // Сбрасываем попытки
                 
                 let msg = TextComponent::text("Login successful! Have fun.");
                 msg.color_named(NamedColor::Green);
                 sender.send_message(msg);
             } else {
-                let msg = TextComponent::text("Incorrect password!");
-                msg.color_named(NamedColor::DarkRed);
-                sender.send_message(msg);
+                // Неправильный пароль
+                let attempts = state.add_failed_attempt(&uuid);
+                
+                if attempts >= 3 {
+                    state.temp_ban(&uuid, 300); // Бан на 5 минут (300 сек)
+                    state.reset_attempts(&uuid); // Сбрасываем счетчик, бан уже выдан
+                    
+                    let msg = TextComponent::text("You have been banned for 5 minutes due to too many failed attempts!");
+                    msg.color_named(NamedColor::DarkRed);
+                    sender.send_message(msg);
+                } else {
+                    let msg = TextComponent::text(&format!("Incorrect password! Attempts left: {}", 3 - attempts));
+                    msg.color_named(NamedColor::Red);
+                    sender.send_message(msg);
+                }
             }
         }
 
@@ -277,7 +384,7 @@ impl Plugin for AuthPlugin {
             name: "PumpkinAuth".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             authors: vec!["Assistant".into()],
-            description: "Basic registration and authentication system with freeze.".into(),
+            description: "Authentication system with limits and blocks protection.".into(),
             dependencies: vec![],
         }
     }
@@ -285,16 +392,17 @@ impl Plugin for AuthPlugin {
     fn on_load(&mut self, context: Context) -> pumpkin_plugin_api::Result<()> {
         info!("Loading PumpkinAuth...");
 
-        // Init database and state
         AuthState::init(&context);
 
-        // Register event handlers
+        context.register_event_handler(LoginHandler, EventPriority::Highest, true)?;
         context.register_event_handler(JoinHandler, EventPriority::Highest, true)?;
         context.register_event_handler(LeaveHandler, EventPriority::Highest, true)?;
         context.register_event_handler(ChatHandler, EventPriority::Highest, true)?;
-        
-        // Регистрируем наш новый обработчик передвижения с высшим приоритетом:
         context.register_event_handler(MoveHandler, EventPriority::Highest, true)?;
+        
+        context.register_event_handler(BlockBreakHandler, EventPriority::Highest, true)?;
+        context.register_event_handler(BlockPlaceHandler, EventPriority::Highest, true)?;
+        context.register_event_handler(BlockCanBuildHandler, EventPriority::Highest, true)?;
 
         let perm_auth = Permission {
             node: "PumpkinAuth:command.auth".into(),
@@ -304,14 +412,12 @@ impl Plugin for AuthPlugin {
         };
         context.register_permission(&perm_auth)?;
 
-        // Register /register command
         let cmd_register = Command::new(&["register".to_string(), "reg".to_string()], "Register an account");
         let pwd_node = CommandNode::argument("password", &ArgumentType::String(StringType::SingleWord));
         pwd_node.then(CommandNode::argument("confirm", &ArgumentType::String(StringType::SingleWord)).execute(RegisterExecutor));
         cmd_register.then(pwd_node);
         context.register_command(cmd_register, "PumpkinAuth:command.auth");
 
-        // Register /login command
         let cmd_login = Command::new(&["login".to_string(), "l".to_string()], "Login to your account");
         cmd_login.then(CommandNode::argument("password", &ArgumentType::String(StringType::SingleWord)).execute(LoginExecutor));
         context.register_command(cmd_login, "PumpkinAuth:command.auth");
