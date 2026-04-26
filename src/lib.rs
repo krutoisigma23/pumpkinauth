@@ -22,6 +22,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use tracing::{error, info};
 
+const MIN_PASSWORD_LENGTH: usize = 6;
+const MAX_PASSWORD_LENGTH: usize = 32;
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct AuthDataStore {
     pub passwords: HashMap<String, String>,
@@ -322,6 +325,22 @@ impl CommandHandler for RegisterExecutor {
 
         let Arg::Simple(pass1) = args.get_value("password") else { return Ok(0); };
         let Arg::Simple(pass2) = args.get_value("confirm") else { return Ok(0); };
+
+        let pass_len = pass1.chars().count();
+
+        if pass_len < MIN_PASSWORD_LENGTH {
+            let msg = TextComponent::text(&format!("Password is too short! Minimum {} characters.", MIN_PASSWORD_LENGTH));
+            msg.color_named(NamedColor::Red);
+            sender.send_message(msg);
+            return Ok(0);
+        }
+
+        if pass_len > MAX_PASSWORD_LENGTH {
+            let msg = TextComponent::text(&format!("Password is too long! Maximum {} characters.", MAX_PASSWORD_LENGTH));
+            msg.color_named(NamedColor::Red);
+            sender.send_message(msg);
+            return Ok(0);
+        }
 
         if pass1 != pass2 {
             let msg = TextComponent::text("Passwords do not match!");
