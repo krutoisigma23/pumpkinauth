@@ -18,22 +18,25 @@ use pumpkin_plugin_api::{
     permission::{Permission, PermissionDefault},
     text::{NamedColor, TextComponent},
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use tracing::{error, info};
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct AuthDataStore {
+    pub passwords: HashMap<String, String>,
+    pub bans: HashMap<String, u64>,
+}
 
 // --- GLOBAL STATE ---
 
 pub static AUTH_STATE: OnceLock<AuthState> = OnceLock::new();
 
 pub struct AuthState {
-    // Database: Player UUID -> Hashed password
     pub database: Arc<Mutex<HashMap<String, String>>>,
-    // Sessions: UUIDs of currently logged in players
-    pub logged_in: Arc<Mutex<HashSet<String>>>,
-    
-    pub login_attempts: Arc<Mutex<HashMap<String, u8>>>,
     pub temp_bans: Arc<Mutex<HashMap<String, u64>>>,
-    
+    pub logged_in: Arc<Mutex<HashSet<String>>>,
+    pub login_attempts: Arc<Mutex<HashMap<String, u8>>>,
     pub data_path: PathBuf,
 }
 
@@ -42,41 +45,58 @@ impl AuthState {
         let mut path = PathBuf::from(context.get_data_folder());
         path.push("auth_database.json");
 
-        let database = Self::load_db(&path);
+        let store = Self::load_db(&path);
 
         let state = AuthState {
-            database: Arc::new(Mutex::new(database)),
+            database: Arc::new(Mutex::new(store.passwords)),
+            temp_bans: Arc::new(Mutex::new(store.bans)),
             logged_in: Arc::new(Mutex::new(HashSet::new())),
             login_attempts: Arc::new(Mutex::new(HashMap::new())),
-            temp_bans: Arc::new(Mutex::new(HashMap::new())),
             data_path: path,
         };
 
         AUTH_STATE.set(state).ok();
     }
 
-    fn load_db(path: &Path) -> HashMap<String, String> {
+    fn load_db(path: &Path) -> AuthDataStore {
         match File::open(path) {
             Ok(mut file) => {
                 let mut data = String::new();
                 if file.read_to_string(&mut data).is_ok() {
-                    if let Ok(db) = serde_json::from_str(&data) {
-                        return db;
+                    if let Ok(store) = serde_json::from_str::<AuthDataStore>(&data) {
+                        return store;
+                    }
+                    if let Ok(old_db) = serde_json::from_str::<HashMap<String, String>>(&data) {
+                        info!("Migrating old auth database to new format...");
+                        return AuthDataStore {
+                            passwords: old_db,
+                            bans: HashMap::new(),
+                        };
                     }
                 }
-                HashMap::new()
+                AuthDataStore::default()
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => HashMap::new(),
+            Err(e) if e.kind() == ErrorKind::NotFound => AuthDataStore::default(),
             Err(e) => {
                 error!("Failed to read auth database: {}", e);
-                HashMap::new()
+                AuthDataStore::default()
             }
         }
     }
 
     pub fn save_db(&self) {
-        let db = self.database.lock().unwrap();
-        if let Ok(json) = serde_json::to_string_pretty(&*db) {
+        let passwords = self.database.lock().unwrap().clone();
+        
+        let now = Self::unix_now();
+        let mut bans = self.temp_bans.lock().unwrap();
+        bans.retain(|_, &mut expire| expire > now);
+
+        let store = AuthDataStore {
+            passwords,
+            bans: bans.clone(),
+        };
+
+        if let Ok(json) = serde_json::to_string_pretty(&store) {
             if let Ok(mut file) = File::create(&self.data_path) {
                 let _ = file.write_all(json.as_bytes());
             } else {
@@ -99,7 +119,6 @@ impl AuthState {
     pub fn is_logged_in(&self, uuid: &str) -> bool {
         self.logged_in.lock().unwrap().contains(uuid)
     }
-
 
     pub fn unix_now() -> u64 {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
@@ -130,6 +149,36 @@ impl AuthState {
     pub fn temp_ban(&self, uuid: &str, duration_secs: u64) {
         let expire = Self::unix_now() + duration_secs;
         self.temp_bans.lock().unwrap().insert(uuid.to_string(), expire);
+        self.save_db();
+    }
+}
+
+
+pub mod api {
+    use super::AUTH_STATE;
+
+    pub fn is_registered(uuid: &str) -> bool {
+        if let Some(state) = AUTH_STATE.get() {
+            state.is_registered(uuid)
+        } else {
+            false
+        }
+    }
+
+    pub fn is_logged_in(uuid: &str) -> bool {
+        if let Some(state) = AUTH_STATE.get() {
+            state.is_logged_in(uuid)
+        } else {
+            false
+        }
+    }
+
+    pub fn is_banned(uuid: &str) -> bool {
+        if let Some(state) = AUTH_STATE.get() {
+            state.get_ban_time_left(uuid).is_some()
+        } else {
+            false
+        }
     }
 }
 
@@ -138,8 +187,8 @@ impl AuthState {
 struct LoginHandler;
 impl EventHandler<PlayerLoginEvent> for LoginHandler {
     fn handle(&self, _server: Server, mut event: EventData<PlayerLoginEvent>) -> EventData<PlayerLoginEvent> {
-        let state = AUTH_STATE.get().unwrap();
         let uuid = event.player.get_id();
+        let state = AUTH_STATE.get().unwrap();
 
         if let Some(left) = state.get_ban_time_left(&uuid) {
             let msg = TextComponent::text(&format!("You are temporarily banned! Wait {} seconds.", left));
@@ -153,29 +202,25 @@ impl EventHandler<PlayerLoginEvent> for LoginHandler {
 struct JoinHandler;
 impl EventHandler<PlayerJoinEvent> for JoinHandler {
     fn handle(&self, _server: Server, event: EventData<PlayerJoinEvent>) -> EventData<PlayerJoinEvent> {
-        let state = AUTH_STATE.get().unwrap();
         let uuid = event.player.get_id();
+        let state = AUTH_STATE.get().unwrap();
 
         let msg = TextComponent::text("");
         
         if state.is_registered(&uuid) {
             let info = TextComponent::text("Welcome back! Please login: ");
             info.color_named(NamedColor::Yellow);
-            
             let cmd = TextComponent::text("/login <password>");
             cmd.color_named(NamedColor::Red);
             cmd.bold(true);
-            
             msg.add_child(info);
             msg.add_child(cmd);
         } else {
             let info = TextComponent::text("Welcome! Please register: ");
             info.color_named(NamedColor::Yellow);
-            
             let cmd = TextComponent::text("/register <password> <confirm_password>");
             cmd.color_named(NamedColor::Red);
             cmd.bold(true);
-            
             msg.add_child(info);
             msg.add_child(cmd);
         }
@@ -188,9 +233,10 @@ impl EventHandler<PlayerJoinEvent> for JoinHandler {
 struct LeaveHandler;
 impl EventHandler<PlayerLeaveEvent> for LeaveHandler {
     fn handle(&self, _server: Server, event: EventData<PlayerLeaveEvent>) -> EventData<PlayerLeaveEvent> {
-        let state = AUTH_STATE.get().unwrap();
         let uuid = event.player.get_id();
+        let state = AUTH_STATE.get().unwrap();
         state.logged_in.lock().unwrap().remove(&uuid);
+        state.reset_attempts(&uuid); // Сбрасываем попытки при выходе
         event
     }
 }
@@ -198,8 +244,7 @@ impl EventHandler<PlayerLeaveEvent> for LeaveHandler {
 struct ChatHandler;
 impl EventHandler<PlayerChatEvent> for ChatHandler {
     fn handle(&self, _server: Server, mut event: EventData<PlayerChatEvent>) -> EventData<PlayerChatEvent> {
-        let state = AUTH_STATE.get().unwrap();
-        if !state.is_logged_in(&event.player.get_id()) {
+        if !api::is_logged_in(&event.player.get_id()) {
             event.cancelled = true;
             let warning = TextComponent::text("You cannot chat before logging in!");
             warning.color_named(NamedColor::Red);
@@ -212,8 +257,7 @@ impl EventHandler<PlayerChatEvent> for ChatHandler {
 struct MoveHandler;
 impl EventHandler<PlayerMoveEvent> for MoveHandler {
     fn handle(&self, _server: Server, mut event: EventData<PlayerMoveEvent>) -> EventData<PlayerMoveEvent> {
-        let state = AUTH_STATE.get().unwrap();
-        if !state.is_logged_in(&event.player.get_id()) {
+        if !api::is_logged_in(&event.player.get_id()) {
             event.cancelled = true;
         }
         event
@@ -223,12 +267,8 @@ impl EventHandler<PlayerMoveEvent> for MoveHandler {
 struct BlockBreakHandler;
 impl EventHandler<BlockBreakEvent> for BlockBreakHandler {
     fn handle(&self, _server: Server, mut event: EventData<BlockBreakEvent>) -> EventData<BlockBreakEvent> {
-        let state = AUTH_STATE.get().unwrap();
-        
-        // В документации сказано "contains the player (if any)", поэтому используем Option
         if let Some(player) = &event.player {
-            let uuid = player.get_id();
-            if !state.is_logged_in(&uuid) {
+            if !api::is_logged_in(&player.get_id()) {
                 event.cancelled = true;
             }
         }
@@ -239,8 +279,7 @@ impl EventHandler<BlockBreakEvent> for BlockBreakHandler {
 struct BlockPlaceHandler;
 impl EventHandler<BlockPlaceEvent> for BlockPlaceHandler {
     fn handle(&self, _server: Server, mut event: EventData<BlockPlaceEvent>) -> EventData<BlockPlaceEvent> {
-        let state = AUTH_STATE.get().unwrap();
-        if !state.is_logged_in(&event.player.get_id()) {
+        if !api::is_logged_in(&event.player.get_id()) {
             event.cancelled = true;
         }
         event
@@ -250,8 +289,7 @@ impl EventHandler<BlockPlaceEvent> for BlockPlaceHandler {
 struct BlockCanBuildHandler;
 impl EventHandler<BlockCanBuildEvent> for BlockCanBuildHandler {
     fn handle(&self, _server: Server, mut event: EventData<BlockCanBuildEvent>) -> EventData<BlockCanBuildEvent> {
-        let state = AUTH_STATE.get().unwrap();
-        if !state.is_logged_in(&event.player.get_id()) {
+        if !api::is_logged_in(&event.player.get_id()) {
             event.cancelled = true;
         }
         event
@@ -267,15 +305,15 @@ impl CommandHandler for RegisterExecutor {
         let uuid = player.get_id();
         let state = AUTH_STATE.get().unwrap();
 
-        // Проверяем бан
-        if let Some(left) = state.get_ban_time_left(&uuid) {
+        if api::is_banned(&uuid) {
+            let left = state.get_ban_time_left(&uuid).unwrap();
             let msg = TextComponent::text(&format!("You are banned! Please wait {} seconds.", left));
             msg.color_named(NamedColor::Red);
             sender.send_message(msg);
             return Ok(0);
         }
 
-        if state.is_registered(&uuid) {
+        if api::is_registered(&uuid) {
             let msg = TextComponent::text("You are already registered! Use /login.");
             msg.color_named(NamedColor::Red);
             sender.send_message(msg);
@@ -313,21 +351,22 @@ impl CommandHandler for LoginExecutor {
         let uuid = player.get_id();
         let state = AUTH_STATE.get().unwrap();
 
-        if let Some(left) = state.get_ban_time_left(&uuid) {
+        if api::is_banned(&uuid) {
+            let left = state.get_ban_time_left(&uuid).unwrap();
             let msg = TextComponent::text(&format!("You are banned! Please wait {} seconds.", left));
             msg.color_named(NamedColor::Red);
             sender.send_message(msg);
             return Ok(0);
         }
 
-        if !state.is_registered(&uuid) {
+        if !api::is_registered(&uuid) {
             let msg = TextComponent::text("You are not registered! Use /register.");
             msg.color_named(NamedColor::Red);
             sender.send_message(msg);
             return Ok(0);
         }
 
-        if state.is_logged_in(&uuid) {
+        if api::is_logged_in(&uuid) {
             let msg = TextComponent::text("You are already logged in!");
             msg.color_named(NamedColor::Yellow);
             sender.send_message(msg);
@@ -337,32 +376,36 @@ impl CommandHandler for LoginExecutor {
         let Arg::Simple(password) = args.get_value("password") else { return Ok(0); };
         let input_hash = AuthState::hash_password(password.as_str());
 
-        let db = state.database.lock().unwrap();
-        if let Some(saved_hash) = db.get(&uuid) {
-            if saved_hash == &input_hash {
-                // Правильный пароль
-                state.logged_in.lock().unwrap().insert(uuid.clone());
-                state.reset_attempts(&uuid); // Сбрасываем попытки
+        let is_password_correct = {
+            let db = state.database.lock().unwrap();
+            if let Some(saved_hash) = db.get(&uuid) {
+                saved_hash == &input_hash
+            } else {
+                false
+            }
+        };
+
+        if is_password_correct {
+            state.logged_in.lock().unwrap().insert(uuid.clone());
+            state.reset_attempts(&uuid);
+            
+            let msg = TextComponent::text("Login successful! Have fun.");
+            msg.color_named(NamedColor::Green);
+            sender.send_message(msg);
+        } else {
+            let attempts = state.add_failed_attempt(&uuid);
+            
+            if attempts >= 3 {
+                state.temp_ban(&uuid, 300); // Бан на 5 минут
+                state.reset_attempts(&uuid);
                 
-                let msg = TextComponent::text("Login successful! Have fun.");
-                msg.color_named(NamedColor::Green);
+                let msg = TextComponent::text("You have been banned for 5 minutes due to too many failed attempts!");
+                msg.color_named(NamedColor::DarkRed);
                 sender.send_message(msg);
             } else {
-                // Неправильный пароль
-                let attempts = state.add_failed_attempt(&uuid);
-                
-                if attempts >= 3 {
-                    state.temp_ban(&uuid, 300); // Бан на 5 минут (300 сек)
-                    state.reset_attempts(&uuid); // Сбрасываем счетчик, бан уже выдан
-                    
-                    let msg = TextComponent::text("You have been banned for 5 minutes due to too many failed attempts!");
-                    msg.color_named(NamedColor::DarkRed);
-                    sender.send_message(msg);
-                } else {
-                    let msg = TextComponent::text(&format!("Incorrect password! Attempts left: {}", 3 - attempts));
-                    msg.color_named(NamedColor::Red);
-                    sender.send_message(msg);
-                }
+                let msg = TextComponent::text(&format!("Incorrect password! Attempts left: {}", 3 - attempts));
+                msg.color_named(NamedColor::Red);
+                sender.send_message(msg);
             }
         }
 
@@ -384,7 +427,7 @@ impl Plugin for AuthPlugin {
             name: "PumpkinAuth".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             authors: vec!["Assistant".into()],
-            description: "Authentication system with limits and blocks protection.".into(),
+            description: "Core Authentication system providing API, limits, and protection.".into(),
             dependencies: vec![],
         }
     }
@@ -394,12 +437,18 @@ impl Plugin for AuthPlugin {
 
         AuthState::init(&context);
 
+        info!("Running API tests...");
+        let dummy_uuid = "00000000-0000-0000-0000-000000000000";
+        info!("API Test -> is_registered: {}", api::is_registered(dummy_uuid));
+        info!("API Test -> is_logged_in: {}", api::is_logged_in(dummy_uuid));
+        info!("API Test -> is_banned: {}", api::is_banned(dummy_uuid));
+        info!("API tests passed successfully!");
+
         context.register_event_handler(LoginHandler, EventPriority::Highest, true)?;
         context.register_event_handler(JoinHandler, EventPriority::Highest, true)?;
         context.register_event_handler(LeaveHandler, EventPriority::Highest, true)?;
         context.register_event_handler(ChatHandler, EventPriority::Highest, true)?;
         context.register_event_handler(MoveHandler, EventPriority::Highest, true)?;
-        
         context.register_event_handler(BlockBreakHandler, EventPriority::Highest, true)?;
         context.register_event_handler(BlockPlaceHandler, EventPriority::Highest, true)?;
         context.register_event_handler(BlockCanBuildHandler, EventPriority::Highest, true)?;
