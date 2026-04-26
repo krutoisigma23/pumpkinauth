@@ -1,0 +1,18 @@
+[package]
+name = "pumpkin_auth"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pumpkin-plugin-api = { version = "0.1.0", git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpkin-plugin-api" }
+tracing = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = "1.0"
+sha2 = "0.10" # Чистый Rust крейт для хеширования (отлично работает в WASM)
+
+[profile.release]
+lto = true
